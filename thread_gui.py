@@ -5,12 +5,12 @@ import sys
 cur_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(cur_dir)
 import serial
-import serial.tools.list_ports
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject
+import serial.tools.list_ports as list_ports
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject, QRunnable, QThreadPool,QMutex, QMutexLocker
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (QMainWindow, QLabel, QPushButton, QVBoxLayout, 
                             QHBoxLayout, QWidget, QCheckBox, QRadioButton, 
-                            QMessageBox)
+                            QMessageBox,QApplication, QSizePolicy)
 import onnxruntime as rt
 import yaml
 import cv2
@@ -21,23 +21,152 @@ import struct
 import shutil
 from PyCameraList.camera_device import list_video_devices
 
-'''
-pyinstaller --onedir thor.py -c  --hidden-import encodings  --hidden-import codecs  --hidden-import io  --hidden-import _io  --hidden-import zipimport  --paths "thor_pk\Lib\site-packages"  --add-data "thor_pk\Lib\encodings;encodings"  --add-data "thor_pk\Lib\codecs.py;."  --add-data "thor_pk\Lib\io.py;."  --hidden-import start --hidden-import pyimod02_importers --hidden-import jinja2 --hidden-import sip
-'''
+    
+class WorkerSignals(QObject):
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+    progress = pyqtSignal(str)
+
+class SafeRunnable(QRunnable):
+    def __init__(self, parent=None):
+        super().__init__()
+        self.signals = WorkerSignals()
+        if parent:
+            self.signals.setParent(parent) # 绑定父对象生命周期
+        self.mutex = QMutex()
+        self._active  = True
+    def is_active(self):
+        with QMutexLocker(self.mutex):
+            return self._active
+    def cancel(self):
+        with QMutexLocker(self.mutex):
+            self._active = False
+
+class InitWorker(SafeRunnable):
+    def __init__(self, config_path, parent=None):
+        super().__init__(parent)
+        self.config_path = config_path
+        # self.signals = WorkerSignals()
+        # self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            if not self.is_active(): return
+
+            # 加载配置
+            config = self.load_config()
+
+            # 并行加载模型
+            sess = self.load_model(config['model_path'])
+            segm_sess = self.load_model(config['segm_model_path'], delay=False)
+
+            # 返回结果
+            result = {
+                'config': config,
+                'sess': sess,
+                'input_name': sess.get_inputs()[0].name,  # 可能会错
+                'output_names': [out.name for out in sess.get_outputs()],
+                'segm_sess': segm_sess,
+                'segm_input_name': segm_sess.get_inputs()[0].name,  
+                'segm_output_names': [out.name for out in sess.get_outputs()]               
+            }
+            self.signals.finished.emit(result)
+        except Exception as e:
+            if self.is_active():    
+                self.signals.error.emit(f"配置文件初始化失败: {str(e)}")
+
+    def load_config(self):
+        with open(self.config_path, "r",encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+
+            if 'cached_camera_index' not in config:
+                # 初始化缓存字段
+                config.setdefault('cached_camera_index', None)
+                config.setdefault('cached_serial_port', None)
+
+            return config
+    
+    def load_model(self, model_path, delay=False):
+        if delay: return None # 延迟加载分割模型
         
-def Scan_serial():
-    port_list = list(serial.tools.list_ports.comports())
-    if len(port_list) == 0:
-        print('无可用串口')
-        ser = -1
-    else:
-        if len(port_list) == 1:
-            port = port_list[0].device
-            ser = serial.Serial(port, 115200, bytesize=serial.EIGHTBITS, stopbits=serial.STOPBITS_ONE, 
-                                parity=serial.PARITY_NONE, timeout=0.005)
-        else:
-            ser = -2
-    return ser
+        so = rt.SessionOptions()
+        so.intra_op_num_threads = 2
+        return rt.InferenceSession(model_path, so, providers=['CPUExecutionProvider'])
+    
+class CameraWorker(SafeRunnable):
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.config = config
+        # self.signals = WorkerSignals()
+        # self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            if not self.is_active(): return
+            camera = self.init_camera()
+            self.signals.finished.emit(camera)
+        except Exception as e:
+            if self.is_active():    
+                self.signals.error.emit(f"相机初始化失败: {str(e)}")
+
+    def init_camera(self):
+        # 优先使用缓存索引
+        if self.config['cached_camera_index'] is not None:
+            camera = cv2.VideoCapture(self.config['cached_camera_index'])
+            if camera.isOpened():
+                self.set_camera_props(camera)
+                return camera
+        
+        # 缓存失效重新检测
+        devices = list_video_devices()
+        valid_devices = [(idx, name) for idx, name in devices 
+                        if 'obs' not in name.lower() and 'webcam' not in name.lower()]
+        print(valid_devices)
+        if len(valid_devices) == 1:
+            index, _ = valid_devices[0]
+            print('camera index:', index)
+            self.config['cached_camera_index'] = index
+            camera = cv2.VideoCapture(index)
+            self.set_camera_props(camera)
+            return camera
+        raise RuntimeError("找不到唯一相机设备" if len(valid_devices)==0 else "检测到多个相机")
+    
+    def set_camera_props(self, camera):
+        camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+        camera.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
+        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 2880)
+        camera.set(cv2.CAP_PROP_FPS, 20)
+        
+class SerialWorker(SafeRunnable):
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.config = config
+        # self.signals = WorkerSignals()
+        # self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            if not self.is_active(): return
+            ser = self.init_serial()
+            self.signals.finished.emit(ser)
+        except Exception as e:
+            if self.is_active():    
+                self.signals.error.emit(f"串口初始化失败: {str(e)}")
+    def init_serial(self):
+        # 优先使用缓存端口
+        if self.config['cached_serial_port']:
+            try:
+                ser = serial.Serial(self.config['cached_serial_port'], 115200, timeout=0.005)
+                if ser.is_open:
+                    return ser
+            except: pass
+        
+        ports = list_ports.comports()
+        if len(ports) == 1:
+            port = ports[0].device
+            self.config['cached_serial_port'] = port
+            return serial.Serial(port, 115200, timeout=0.005)
+        raise RuntimeError('找不到唯一串口设备' if len(ports) == 0 else '检测到多个串口设备')
 
 class SerialListener(QThread):
     serial_signal = pyqtSignal(str)
@@ -56,11 +185,11 @@ class SerialListener(QThread):
                         self.serial_signal.emit(data.hex()[2:]) # 发射信号
         except serial.SerialException as e:
             print(f'串口错误：{e}')
+
     def stop(self):
         self.running = False
         self.quit()
         self.wait()
-
 
 def infer_frame(image, sess, input_name, output_names):
     img = np.asarray([image]).astype(np.float32)
@@ -72,283 +201,44 @@ def infer_segm(image, sess, input_name, output_names):
     detection = sess.run(output_names, {input_name: img})[0]
     return detection
 
-
-class InitWorker(QObject):
-    finished = pyqtSignal(dict)
-    error = pyqtSignal(str)
-    progress = pyqtSignal(str)
-
-    def __init__(self, config_path):
-        super().__init__()
-        self.config_path = config_path
-
-    def run(self):
-        try:
-            result = {}
-
-            # 加载配置
-            self.progress.emit("正在加载配置文件...")
-            config = self.load_config()
-            result['config'] = config
-
-            # self.progress.emit("正在初始化相机...")
-            # camera = self.init_camera()
-            # result['camera'] = camera
-            
-            # 加载模型
-            self.progress.emit("正在加载模型...")
-            sess, segm_sess = self.load_models(config)
-            
-            # 返回结果
-            result.update({
-                'sess': sess,
-                'segm_sess': segm_sess,
-                'input_name': sess.get_inputs()[0].name,
-                'output_names': [out.name for out in sess.get_outputs()],
-                'segm_input': segm_sess.get_inputs()[0].name,
-                'segm_outputs': [out.name for out in segm_sess.get_outputs()]
-            })
-            self.finished.emit(result)
-        except Exception as e:
-            self.error.emit(f"初始化失败: {str(e)}")
-
-    def load_config(self):
-        with open(self.config_path, 'r', encoding='utf-8') as f:
-            return yaml.safe_load(f)
-        
-    def init_camera(self):
-        """延迟初始化相机"""
-        try:
-            # 初始化相机为 None
-            camera_list = list_video_devices()
-            device_dict = {camera[1]: camera[0] for camera in camera_list if not any(keyworld.lower() in camera[1].lower() for keyworld in ['obs', 'webcam'])}
-            if len(device_dict) == 1: 
-                camera_index = list(device_dict.values())[0]
-                camera = cv2.VideoCapture(camera_index)  
-                if not camera.isOpened():
-                    raise RuntimeError("无法打开相机设备")
-
-                camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
-                camera.set(cv2.CAP_PROP_FPS, 20)
-                camera.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
-                camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 2880)
-                return camera
-
-        except Exception as e:
-            raise RuntimeError(f"相机初始化失败: {str(e)}")
-
-    def load_models(self, config):
-        # 加载关键点模型
-        if not os.path.exists(config['model_path']):
-            raise FileNotFoundError(f"关键点模型不存在: {config['model_path']}")
-        
-        # 加载分割模型
-        if not os.path.exists(config['segm_model_path']):
-            raise FileNotFoundError(f"分割模型不存在: {config['segm_model_path']}")
-        
-        so = rt.SessionOptions()
-        sess = rt.InferenceSession(
-            config['model_path'], 
-            so, 
-            providers=['CPUExecutionProvider']
-        )
-        
-        so_segm = rt.SessionOptions()
-        segm_sess = rt.InferenceSession(
-            config['segm_model_path'],
-            so_segm,
-            providers=['CPUExecutionProvider']
-        )
-       
-        return sess, segm_sess
-
-class CameraInitWorker(QObject):
-    finished = pyqtSignal(cv2.VideoCapture)
-    error = pyqtSignal(str)
-    def __init__(self):
-        super().__init__()
-
-    def run(self):
-        try:
-            camera = self.init_camera()
-            self.finished.emit(camera)
-        except Exception as e:
-            self.error.emit(f"相机初始化失败: {str(e)}")
-
-    def init_camera(self):
-        """延迟初始化相机"""
-        try:
-            # 初始化相机为 None
-            print(11111)
-            # camera_list = list_video_devices()
-            # device_dict = {camera[1]: camera[0] for camera in camera_list if not any(keyworld.lower() in camera[1].lower() for keyworld in ['obs', 'webcam'])}
-            # if len(device_dict) == 1: 
-                # camera_index = list(device_dict.values())[0]
-            camera = cv2.VideoCapture(1)  
-            print(2222)
-            if not camera.isOpened():
-                raise RuntimeError("无法打开相机设备")
-
-            camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
-            camera.set(cv2.CAP_PROP_FPS, 20)
-            camera.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
-            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 2880)
-            print(33333)
-            return camera
-
-        except Exception as e:
-            raise RuntimeError(f"相机初始化失败: {str(e)}")
-        
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+
+        self.config_path = 'profiles//config.yaml'
         self.camera = None
         self.ser = None
-        self.serial_listener = None
-        self.config_path = 'profiles//config.yaml'
-        self.setup_loading_ui()
-        self.start_async_init()
-        self.start_async_camera_init()
+        self.segm_infer = False
 
-    def setup_loading_ui(self):
-        """初始加载界面"""
-        self.setWindowTitle("Camera Viewer - 加载中...")
+        # 初始化线程池
+        self.thread_pool = QThreadPool.globalInstance()
+
+        # 并行启动初始化任务
+        self.start_paraller_init()
+
+        # 初始化ui
+        self.init_ui()
+        
+    def init_ui(self):
+        self.setWindowTitle('Thor Visin System')
         self.resize(400, 200)
         
-        central_widget = QWidget(self)
-        self.setCentralWidget(central_widget)
-        
-        layout = QVBoxLayout()
-        self.loading_label = QLabel("正在初始化，请稍候...", self)
-        self.progress_label = QLabel("", self)  # 新增进度标签
-        
-        for lbl in [self.loading_label, self.progress_label]:
-            lbl.setAlignment(Qt.AlignCenter)
-            layout.addWidget(lbl)
-        
-        central_widget.setLayout(layout)
-
-    def start_async_init(self):
-        """启动异步初始化"""
-        self.init_thread = QThread()
-        self.init_worker = InitWorker(self.config_path)
-        self.init_worker.moveToThread(self.init_thread)
-        
-        # 连接信号
-        self.init_worker.finished.connect(self.on_init_success)
-        self.init_worker.error.connect(self.on_init_error)
-        self.init_worker.progress.connect(self.update_progress)  # 连接进度信号
-        self.init_thread.started.connect(self.init_worker.run)
-        
-        self.init_thread.start()
-
-    def start_async_camera_init(self):
-        """启动相机异步初始化"""
-        self.camera_init_thread = QThread()
-        self.camera_init_worker = CameraInitWorker()
-        self.camera_init_worker.moveToThread(self.camera_init_thread)
-        
-        # 连接信号
-        self.camera_init_worker.finished.connect(self.on_camera_init_success)
-        self.camera_init_worker.error.connect(self.on_camera_init_error)
-        self.camera_init_thread.started.connect(self.camera_init_worker.run)
-        
-        self.camera_init_thread.start()
-
-    def update_progress(self, message):
-        """更新加载进度"""
-        self.progress_label.setText(message)
-        QApplication.processEvents()  # 强制刷新UI
-
-    def on_init_success(self, result):
-        """初始化成功处理"""
-        try:
-            self.segm_infer = False
-            # 保存初始化结果
-            self.config = result['config']
-            # self.camera = result['camera']
-
-            self.base_point = self.config['base_point'] 
-            self.origin_x = self.base_point[0]
-            self.origin_y = self.base_point[1]   
-            self.coordinate = [self.origin_x, self.origin_y]
-        
-            self.factor = self.config['factor']
-
-            self.head_x_offset = self.config['head_roi']['x_offset']
-            self.head_w = self.config['head_roi']['w']
-            self.head_h = self.config['head_roi']['h']
-            self.head_y_offset = self.config['head_roi']['y_offset']
-            # tail
-            self.tail_x_offset = self.config['tail_roi']['x_offset']
-            self.tail_w = self.config['tail_roi']['w']
-            self.tail_h = self.config['tail_roi']['h']
-            self.tail_y_offset = self.config['tail_roi']['y_offset']
-
-
-            self.sess = result['sess']
-            self.segm_sess = result['segm_sess']
-            self.input_name = result['input_name']
-            self.output_names = result['output_names']
-            self.segm_input = result['segm_input']
-            self.segm_outputs = result['segm_outputs']
-            
-            # 关闭初始化线程
-            self.init_thread.quit()
-            self.init_thread.wait()
-            
-            # 设置主界面
-            self.setup_main_ui()
-            self.post_init_setup()
-            self.init_serial()
-            self.disable_all_buttons()
-
-            self.setWindowTitle("Camera Viewer")
-        except Exception as e:
-            self.show_error_message(f"界面初始化失败: {str(e)}")
-
-    def on_camera_init_success(self, camera):
-        # self.progress_label.setText("相机初始化成功")
-        # 这里可以将 camera 对象保存起来以供后续使用
-        # mesg = "相机初始化成功"
-        # self.show_success_message(mesg)
-        self.camera = camera
-        self.enable_all_buttons() 
-        self.camera_init_thread.quit()
-
-    def on_camera_init_error(self, error):
-        # self.progress_label.setText(error)
-        self.camera_init_thread.quit()
-        self.show_error_message(error)
-        self.close()
-
-
-    def on_init_error(self, error_msg):
-        """初始化失败处理"""
-        self.init_thread.quit()
-        self.show_error_message(error_msg)
-        self.close()
-
-    def setup_main_ui(self):
-        """主界面设置"""
-        # 清空加载界面
-        self.centralWidget().layout().removeWidget(self.loading_label)
-        self.loading_label.deleteLater()
-        
-        # 创建主界面控件
         self.create_widgets()
         self.setup_layout()
         self.connect_signals()
+        self.disable_all_buttons()
 
     def create_widgets(self):
         """创建界面控件"""
         # 图像显示
         self.image_label = QLabel(self)
         self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         self.image_label.setMinimumSize(320, 240)
         
         self.infer_label = QLabel(self)
         self.infer_label.setAlignment(Qt.AlignCenter)
+        self.infer_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         self.infer_label.setMinimumSize(320, 240)
         self.infer_label.setVisible(False)
         
@@ -430,66 +320,276 @@ class MainWindow(QMainWindow):
         
         # 重新加载按钮
         self.reload_buttons[0].clicked.connect(self.reload_config)
-        self.reload_buttons[1].clicked.connect(self.init_camera)
-        self.reload_buttons[2].clicked.connect(self.init_serial)
+        self.reload_buttons[1].clicked.connect(self.reload_camera)
+        self.reload_buttons[2].clicked.connect(self.reload_serial)
 
-    def post_init_setup(self):
-        """后续初始化（非关键）"""
- 
-        # 定时器
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_frame)
+    def start_paraller_init(self):
+        self.config_worker = InitWorker(self.config_path, self)
+        self.config_worker.signals.finished.connect(self.on_config_loaded)
+        self.config_worker.signals.error.connect(self.show_error)
+        self.thread_pool.start(self.config_worker)
+
+    def on_config_loaded(self, result):
+
+        self.config = result['config']
+        self.sess = result['sess']
+        self.input_name = result['input_name']
+        self.output_names = result['output_names']
+
+        self.segm_sess = result['segm_sess']
+        self.segm_input_name = result['segm_input_name']
+        self.segm_output_names = result['segm_output_names']
+
+        self.base_point = self.config['base_point'] 
+        self.origin_x = self.base_point[0]
+        self.origin_y = self.base_point[1]   
+        self.coordinate = [self.origin_x, self.origin_y]
+    
+        self.factor = self.config['factor']
+
+        self.head_x_offset = self.config['head_roi']['x_offset']
+        self.head_w = self.config['head_roi']['w']
+        self.head_h = self.config['head_roi']['h']
+        self.head_y_offset = self.config['head_roi']['y_offset']
+        # tail
+        self.tail_x_offset = self.config['tail_roi']['x_offset']
+        self.tail_w = self.config['tail_roi']['w']
+        self.tail_h = self.config['tail_roi']['h']
+        self.tail_y_offset = self.config['tail_roi']['y_offset']
+
+        # 硬件初始化
+        if not self.reload_buttons[0].isChecked():
+            self.start_hardware_init()
+    
+    def start_hardware_init(self):
+        
+        self.reload_camera()
+        self.reload_serial()
+
+        # self.camera_worker = CameraWorker(self.config)
+        # self.camera_worker.signals.finished.connect(self.on_camera_ready)
+        # self.camera_worker.signals.error.connect(lambda e: self.show_error(e))
+
+        # self.serial_worker = SerialWorker(self.config)
+        # self.serial_worker.signals.finished.connect(self.on_serial_ready)
+        # self.serial_worker.signals.error.connect(lambda e: self.show_error(e))
+
+        # self.thread_pool.start(self.camera_worker)
+        # self.thread_pool.start(self.serial_worker)
+
+    def reload_config(self):
+        self.config_worker = InitWorker(self.config_path, self)
+        self.config_worker.signals.finished.connect(self.on_config_loaded)
+        self.config_worker.signals.error.connect(self.show_error)
+        self.thread_pool.start(self.config_worker)
+
+    def reload_camera(self):
+        if self.camera is None:
+            self.camera_worker = CameraWorker(self.config, self)  
+            self.camera_worker.signals.finished.connect(self.on_camera_ready)
+            self.camera_worker.signals.error.connect(self.show_error)
+            self.thread_pool.start(self.camera_worker)
+
+    def reload_serial(self):
+        if self.ser is None:
+            self.serial_worker = SerialWorker(self.config, self)
+            self.serial_worker.signals.finished.connect(self.on_serial_ready)
+            self.serial_worker.signals.error.connect(self.show_error)
+            self.thread_pool.start(self.serial_worker)
+
+    def on_camera_ready(self, camera):
+        self.camera = camera
+        self.enable_all_buttons()
+        self.start_preview()
+
+    def on_serial_ready(self, ser):
+        self.ser = ser
+        print(self.ser)
+        self.serial_listener = SerialListener(self.ser)
+        self.serial_listener.serial_signal.connect(self.ser_infer)
+        self.serial_listener.start()
+    
+    ### 待定， 初始化失败
+    def on_init_error(self, error_msg):
+        self.show_error(error_msg)
+        self.close()
+    ###################
+
+    def show_error(self, error_msg):
+        QMessageBox.critical(self, "错误", error_msg)
+
+    def toggle_timer(self, state):
+        if state == 2:
+            self.preview_timer.start(33)
+        else:
+            self.preview_timer.stop()
+
+    def start_preview(self):
+        self.preview_timer = QTimer(self)
+        self.preview_timer.timeout.connect(self.update_preview)
+        # self.preview_timer.start(33)
         
         self.infer_timer = QTimer(self)
         self.infer_timer.timeout.connect(self.run_inference)
         self.infer_running = False
-        
 
-    def init_camera(self):
-        """延迟初始化相机"""
-        if self.camera is None:
-            try:
-                # 初始化相机为 None
-                self.camera_list = list_video_devices()
-                device_dict = {camera[1]: camera[0] for camera in self.camera_list if not any(keyworld.lower() in camera[1].lower() for keyworld in ['obs', 'webcam'])}
-                if len(device_dict) == 1: 
-                    camera_index = list(device_dict.values())[0]
-                    self.camera = cv2.VideoCapture(camera_index)  
-                    self.camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
-                    self.camera.set(cv2.CAP_PROP_FPS, 20)
-                    self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
-                    self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 2880)
-                    # ret, frame = self.camera.read()
-                elif len(device_dict) > 1:
-                    QMessageBox.warning(self, '错误', '插入多个相机', QMessageBox.Yes)
-                else:
-                    QMessageBox.warning(self, '错误', '未找到可用的相机!', QMessageBox.Yes)
-            except Exception as e:
-                self.show_error_message(f"相机初始化失败: {str(e)}")
+    def toggle_inference(self):
+        if self.infer_running:
+            self.infer_timer.stop()
+            self.infer_running = False
+            self.inference_button.setText("执行推理")
+            
+        else:
+            if self.reload_buttons[0].isChecked():
+                self.reload_config()
+                self.reload_buttons[0].setChecked(False)
 
-    def init_serial(self):
-        """延迟初始化串口"""
-        if self.ser is None:
-            try:
-                self.ser = Scan_serial()
-                if self.ser == -1:
-                    QMessageBox.warning(self, '错误', '未找到可用的串口！', QMessageBox.Yes)
-                elif self.ser == -2:
-                    QMessageBox.warning(self, '错误', '插入多个串口', QMessageBox.Yes)
-                else:
-                    self.serial_listener = SerialListener(self.ser)
-                    self.serial_listener.serial_signal.connect(self.ser_infer)
-                    self.serial_listener.start()
-            except Exception as e:
-                self.show_error_message(f"串口初始化失败: {str(e)}")
+            self.infer_timer.start(30)  
+            self.infer_running = True
+            self.inference_button.setText("停止推理")
 
-    def show_error_message(self, msg):
-        """显示错误信息"""
-        QMessageBox.critical(self, "错误", msg)
-        self.close()
-    
-    def show_success_message(self, ms):
-        QMessageBox.information(self, "提示", ms)
+    def update_preview(self):
+        if self.camera and self.camera.isOpened():
+            ret, frame = self.camera.read()
+            if ret:
+                rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                rgb_image = cv2.resize(rgb_image, (960, 720))
+                # h, w, ch = rgb_image.shape
+                # bytes_per_line = ch * w
+                rgb_image = QImage(rgb_image, 960, 720, QImage.Format_RGB888)
+                q_img = rgb_image.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.image_label.setPixmap(QPixmap.fromImage(q_img))
+
+    ##################################################
+    def disable_all_buttons(self):
+        """禁用所有按钮"""
+        self.checkbox_infer.setEnabled(False)
+        self.save_button.setEnabled(False)
+        self.p_detect_button.setEnabled(False)
+        self.factor_detect_button.setEnabled(False)
+        self.inference_button.setEnabled(False)
+        self.ser_inference_button.setEnabled(False)
+        self.checkbox.setEnabled(False)
+        self.checkbox_segm.setEnabled(False)
+        self.reload_buttons[0].setEnabled(False)
+        self.reload_buttons[1].setEnabled(False)
+        self.reload_buttons[2].setEnabled(False)
+
+    def enable_all_buttons(self):
+        """恢复所有按钮"""
+        self.checkbox_infer.setEnabled(True)
+        self.save_button.setEnabled(True)
+        self.p_detect_button.setEnabled(True)
+        self.factor_detect_button.setEnabled(True)
+        self.inference_button.setEnabled(True)
+        self.ser_inference_button.setEnabled(True)
+        self.checkbox.setEnabled(True)
+        self.checkbox_segm.setEnabled(True)
+        self.reload_buttons[0].setEnabled(True)
+        self.reload_buttons[1].setEnabled(True)
+        self.reload_buttons[2].setEnabled(True)
+    ##################################################
+
+    def run_inference(self):
+        if self.camera is not None:
+            ret, frame = self.camera.read()
+            # 12mm镜头 head
+            if self.front_radio.isChecked():
+                # rotate
+                end_x = self.coordinate[0] + self.head_x_offset
+                start_x = end_x - self.head_w
+                start_y = self.coordinate[1] + self.head_y_offset
+                end_y = start_y + self.head_h
+
+                frame = frame[start_y:end_y, start_x:end_x]
+                print(frame.shape)
+                pad = (800-self.head_h) // 2
+                frame = cv2.copyMakeBorder(frame, pad, pad, 0, 0, cv2.BORDER_CONSTANT, value=[114, 114, 114])
+                frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                roi_rotate_base_p_x = self.origin_y - start_y + pad
+                roi_rotate_base_p_y = self.head_w - (self.origin_x - start_x)
+                print(f'roi_rotate_base_p_x:{roi_rotate_base_p_x}, roi_rotate_base_p_y:{roi_rotate_base_p_y}')
+            else:
+                # 12mm镜头  tail
+                # rotate
+                end_x = self.coordinate[0] + self.tail_x_offset
+                start_x = end_x - self.tail_w
+                end_y = self.coordinate[1] + self.tail_y_offset
+                start_y = end_y - self.tail_h
+                frame = frame[start_y:end_y, start_x:end_x]
+                frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                roi_tail_rotate_base_p_x = self.origin_y - start_y
+                roi_tail_rotate_base_p_y = self.tail_w - (self.origin_x - start_x)
+                print(f'roi_tail_rotate_base_p_x:{roi_tail_rotate_base_p_x}, roi_tail_rotate_base_p_y:{roi_tail_rotate_base_p_y}')
+
+            frame_re = cv2.resize(frame, (800, 1300))
+            frame_as = np.ascontiguousarray(frame_re[:, :, ::-1].transpose(2, 0, 1))
+
+            time_str = time.strftime('%Y_%m_%d_%H_%M_%S', time.localtime())
+            infer_t = time.time()
+            detection = infer_frame(frame_as, self.sess, self.input_name, self.output_names)
+            print(f'kp推理时间：{time.time() - infer_t}s')
+
+            if self.segm_infer:
+                print('开始推理分割模型')
+                frame_size = cv2.resize(frame, (640, 640))
+                frame_se = np.ascontiguousarray(frame_size[:, :, ::-1].transpose(2, 0, 1))
+                pred = infer_segm(frame_se, self.sess_, self.input_name_, self.output_names_)
+                pred = np.where(pred.squeeze() > 0, 255, 0).astype(np.uint8)
+                pred = cv2.resize(pred, (frame.shape[1],frame.shape[0]))
+                pred_bgr = cv2.cvtColor(pred, cv2.COLOR_GRAY2BGR)
+               
+                # contours, _ = cv2.findContours(pred, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                # max_cn = max(contours, key=cv2.contourArea)
+
+            color_list = [[255, 0, 0], [0,255,0]]
+            pts = detection[0][0]
+            if self.front_radio.isChecked():
+                pts[:, 1] = pts[:, 1] * (self.head_w / 1300) # head
+            else:
+                # tail
+                pts[:, 0] = pts[:, 0] * (self.tail_h / 800) 
+                pts[:, 1] = pts[:, 1] * (self.tail_w / 1300) 
+
+            pts = pts[pts[:, 1].argsort()]
+            if pts[0][1] < 0:
+                pts[0][1] = pts[1][1]
+            pts = pts.astype(np.int32)
+            if self.segm_infer:
+                x = get_kde(pred, pts)
+                x = int(x)
+                cv2.line(frame, (x, pts[0][1]), (x, pts[1][1]), (0, 0, 255), 2)
+          
+            for i, pt in enumerate(pts):
+                cv2.circle(frame, tuple(pt.astype(np.int32)), 5, color_list[i], 5)
+     
+            if self.segm_infer:
+                frame = cv2.addWeighted(frame, 0.8, pred_bgr, 0.5, 0)
+            roi_img_cp = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            roi_img_cp = cv2.resize(roi_img_cp, (960, 720))
+            # print(roi_img_cp.shape[1], roi_img_cp.shape[0])
+            image = QImage(roi_img_cp, roi_img_cp.shape[1], roi_img_cp.shape[0], QImage.Format_RGB888)
+            # 调整图像大小以适应标签尺寸
+            scaled_image = image.scaled(self.infer_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.infer_label.setPixmap(QPixmap.fromImage(scaled_image))
+
+    def switch_mode(self, state):
+        if state == 2:
+            self.infer_label.setVisible(True)
+            if not self.infer_label in self.hbox_labels.children():
+                self.hbox_labels.addWidget(self.infer_label)
+        else:
+            self.infer_label.setVisible(False)
+            if self.infer_label in self.hbox_labels.children():
+                self.hbox_labels.removeWidget(self.infer_label)
+
+        self.hbox_labels.update()
+
+    def is_segm(self, state):
+        if state == 2:
+            self.segm_infer = True
+        else:
+            self.segm_infer = False
 
     def ser_infer(self, data):
 
@@ -510,10 +610,12 @@ class MainWindow(QMainWindow):
             os.makedirs(self.result_save_path_tail, exist_ok=True)
         
         self.result_save_path_compose_frame = 'Data/thor_kepoint/infer_result/compose_frame'
+        self.result_save_path_compose_frame = self.result_save_path_compose_frame
         if not os.path.exists(self.result_save_path_compose_frame):
             os.makedirs(self.result_save_path_compose_frame, exist_ok=True)
 
         self.detect_error_save_path = 'Data/thor_kepoint/error_detect'
+        self.detect_error_save_path = self.detect_error_save_path
         if not os.path.exists(self.detect_error_save_path):
             os.makedirs(self.detect_error_save_path, exist_ok=True)
 
@@ -551,7 +653,7 @@ class MainWindow(QMainWindow):
                 segm_t = time.time()
                 frame_size = cv2.resize(frame, (640, 640))
                 frame_se = np.ascontiguousarray(frame_size[:, :, ::-1].transpose(2, 0, 1))
-                pred = infer_segm(frame_se, self.sess_, self.input_name_, self.output_names_)
+                pred = infer_segm(frame_se, self.segm_sess, self.segm_input_name, self.segm_output_names)
                 pred = np.where(pred.squeeze() > 0, 255, 0).astype(np.uint8)
                 pred = cv2.resize(pred, (frame.shape[1],frame.shape[0]))
                 print(f"分割推理时间：{time.time() - segm_t}s")
@@ -652,7 +754,6 @@ class MainWindow(QMainWindow):
             frame = cv2.resize(frame, (800, 1300))
             cv2.imwrite(f'{self.result_save_path_head}/{time_str}_{head_x}_{head_y}_start.png', frame)
 
-
         elif data != False and str(data[0:2]) == '04':
 
             time_read_frame = time.time()
@@ -685,12 +786,11 @@ class MainWindow(QMainWindow):
                 segm_t = time.time()
                 frame_size = cv2.resize(frame, (640, 640))
                 frame_se = np.ascontiguousarray(frame_size[:, :, ::-1].transpose(2, 0, 1))
-                pred = infer_segm(frame_se, self.sess_, self.input_name_, self.output_names_)
+                pred = infer_segm(frame_se, self.segm_sess, self.segm_input_name, self.segm_output_names)
                 pred = np.where(pred.squeeze() > 0, 255, 0).astype(np.uint8)
                 pred = cv2.resize(pred, (frame.shape[1],frame.shape[0]))
                 print(f"分割推理时间：{time.time() - segm_t}s")
                 pred_bgr = cv2.cvtColor(pred, cv2.COLOR_GRAY2BGR)
-
 
             color_list = [[0, 0, 255], [0,255,0]]
             pts = detection[0][0]  
@@ -793,194 +893,9 @@ class MainWindow(QMainWindow):
             scaled_image = image.scaled(self.infer_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.infer_label.setPixmap(QPixmap.fromImage(scaled_image))
 
-    def run_inference(self):
-        if self.camera is not None:
-            ret, frame = self.camera.read()
-            # 12mm镜头 head
-            if self.front_radio.isChecked():
-                # rotate
-                end_x = self.coordinate[0] + self.head_x_offset
-                start_x = end_x - self.head_w
-                start_y = self.coordinate[1] + self.head_y_offset
-                end_y = start_y + self.head_h
-
-                frame = frame[start_y:end_y, start_x:end_x]
-                print(frame.shape)
-                pad = (800-self.head_h) // 2
-                frame = cv2.copyMakeBorder(frame, pad, pad, 0, 0, cv2.BORDER_CONSTANT, value=[114, 114, 114])
-                frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                roi_rotate_base_p_x = self.origin_y - start_y + pad
-                roi_rotate_base_p_y = self.head_w - (self.origin_x - start_x)
-                print(f'roi_rotate_base_p_x:{roi_rotate_base_p_x}, roi_rotate_base_p_y:{roi_rotate_base_p_y}')
-            else:
-                # 12mm镜头  tail
-                # rotate
-                end_x = self.coordinate[0] + self.tail_x_offset
-                start_x = end_x - self.tail_w
-                end_y = self.coordinate[1] + self.tail_y_offset
-                start_y = end_y - self.tail_h
-                frame = frame[start_y:end_y, start_x:end_x]
-                frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                roi_tail_rotate_base_p_x = self.origin_y - start_y
-                roi_tail_rotate_base_p_y = self.tail_w - (self.origin_x - start_x)
-                print(f'roi_tail_rotate_base_p_x:{roi_tail_rotate_base_p_x}, roi_tail_rotate_base_p_y:{roi_tail_rotate_base_p_y}')
-
-            frame_re = cv2.resize(frame, (800, 1300))
-            frame_as = np.ascontiguousarray(frame_re[:, :, ::-1].transpose(2, 0, 1))
-
-            time_str = time.strftime('%Y_%m_%d_%H_%M_%S', time.localtime())
-            infer_t = time.time()
-            detection = infer_frame(frame_as, self.sess, self.input_name, self.output_names)
-            print(f'kp推理时间：{time.time() - infer_t}s')
-
-            if self.segm_infer:
-                print('开始推理分割模型')
-                frame_size = cv2.resize(frame, (640, 640))
-                frame_se = np.ascontiguousarray(frame_size[:, :, ::-1].transpose(2, 0, 1))
-                pred = infer_segm(frame_se, self.sess_, self.input_name_, self.output_names_)
-                pred = np.where(pred.squeeze() > 0, 255, 0).astype(np.uint8)
-                pred = cv2.resize(pred, (frame.shape[1],frame.shape[0]))
-                pred_bgr = cv2.cvtColor(pred, cv2.COLOR_GRAY2BGR)
-               
-                # contours, _ = cv2.findContours(pred, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                # max_cn = max(contours, key=cv2.contourArea)
-
-            color_list = [[255, 0, 0], [0,255,0]]
-            pts = detection[0][0]
-            if self.front_radio.isChecked():
-                pts[:, 1] = pts[:, 1] * (self.head_w / 1300) # head
-            else:
-                # tail
-                pts[:, 0] = pts[:, 0] * (self.tail_h / 800) 
-                pts[:, 1] = pts[:, 1] * (self.tail_w / 1300) 
-
-            pts = pts[pts[:, 1].argsort()]
-            if pts[0][1] < 0:
-                pts[0][1] = pts[1][1]
-            pts = pts.astype(np.int32)
-            if self.segm_infer:
-                x = get_kde(pred, pts)
-                x = int(x)
-                cv2.line(frame, (x, pts[0][1]), (x, pts[1][1]), (0, 0, 255), 2)
-          
-            for i, pt in enumerate(pts):
-                cv2.circle(frame, tuple(pt.astype(np.int32)), 5, color_list[i], 5)
-     
-            if self.segm_infer:
-                frame = cv2.addWeighted(frame, 0.8, pred_bgr, 0.5, 0)
-            roi_img_cp = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            roi_img_cp = cv2.resize(roi_img_cp, (960, 720))
-            # print(roi_img_cp.shape[1], roi_img_cp.shape[0])
-            image = QImage(roi_img_cp, roi_img_cp.shape[1], roi_img_cp.shape[0], QImage.Format_RGB888)
-            # 调整图像大小以适应标签尺寸
-            scaled_image = image.scaled(self.infer_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self.infer_label.setPixmap(QPixmap.fromImage(scaled_image))
-
-    def toggle_inference(self):
-        if self.infer_running:
-            self.infer_timer.stop()
-            self.infer_running = False
-            self.inference_button.setText("执行推理")
-            
-        else:
-            if self.reload_buttons[0].isChecked():
-                self.reload_config()
-                self.reload_buttons[0].setChecked(False)
-
-            self.infer_timer.start(30)  
-            self.infer_running = True
-            self.inference_button.setText("停止推理")
-
-    def reload_config(self):
-        try:
-            with open(self.config_path, 'r', encoding='utf-8') as file:
-                self.config = yaml.safe_load(file)
-            
-            self.base_point = self.config['base_point'] 
-            self.origin_x = self.base_point[0]
-            self.origin_y = self.base_point[1]   
-            self.coordinate = [self.origin_x, self.origin_y]
-        
-            self.factor = self.config['factor']
-
-            self.head_x_offset = self.config['head_roi']['x_offset']
-            self.head_w = self.config['head_roi']['w']
-            self.head_h = self.config['head_roi']['h']
-            self.head_y_offset = self.config['head_roi']['y_offset']
-            # tail
-            self.tail_x_offset = self.config['tail_roi']['x_offset']
-            self.tail_w = self.config['tail_roi']['w']
-            self.tail_h = self.config['tail_roi']['h']
-            self.tail_y_offset = self.config['tail_roi']['y_offset']
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f'加载配置文件错误： {e}')
-            self.close()
-            return
-
-    def disable_all_buttons(self):
-        """禁用所有按钮"""
-        self.checkbox_infer.setEnabled(False)
-        self.save_button.setEnabled(False)
-        self.p_detect_button.setEnabled(False)
-        self.factor_detect_button.setEnabled(False)
-        self.inference_button.setEnabled(False)
-        self.ser_inference_button.setEnabled(False)
-        self.checkbox.setEnabled(False)
-        self.checkbox_segm.setEnabled(False)
-        self.reload_buttons[0].setEnabled(False)
-        self.reload_buttons[1].setEnabled(False)
-        self.reload_buttons[2].setEnabled(False)
-
-    def enable_all_buttons(self):
-        """禁用所有按钮"""
-        self.checkbox_infer.setEnabled(True)
-        self.save_button.setEnabled(True)
-        self.p_detect_button.setEnabled(True)
-        self.factor_detect_button.setEnabled(True)
-        self.inference_button.setEnabled(True)
-        self.ser_inference_button.setEnabled(True)
-        self.checkbox.setEnabled(True)
-        self.checkbox_segm.setEnabled(True)
-        self.reload_buttons[0].setEnabled(True)
-        self.reload_buttons[1].setEnabled(True)
-        self.reload_buttons[2].setEnabled(True)
-
-    def update_frame(self):
-        ret, frame = self.camera.read()
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = cv2.resize(frame, (960, 720))
-        image = QImage(frame, frame.shape[1], frame.shape[0], QImage.Format_RGB888)  
-        # 调整图像大小以适应标签尺寸
-        scaled_image1 = image.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.image_label.setPixmap(QPixmap.fromImage(scaled_image1))
-
-    def toggle_timer(self, state):
-        if state == 2:
-            self.timer.start(33)
-        else:
-            self.timer.stop()
-    def switch_mode(self, state):
-        if state == 2:
-            self.infer_label.setVisible(True)
-            if not self.infer_label in self.hbox_labels.children():
-                self.hbox_labels.addWidget(self.infer_label)
-        else:
-            self.infer_label.setVisible(False)
-            if self.infer_label in self.hbox_labels.children():
-                self.hbox_labels.removeWidget(self.infer_label)
-
-        self.hbox_labels.update()
-
-    def is_segm(self, state):
-        if state == 2:
-            self.segm_infer = True
-        else:
-            self.segm_infer = False
-
-  
     def save_image(self):
-
         save_path = 'Data/thor_keypoint_data'
+        save_path = save_path
         if not os.path.exists(save_path):
             os.makedirs(save_path, exist_ok=True)
         str_time = time.strftime('%Y_%m_%d_%H_%M_%S', time.localtime()) + '.png'
@@ -1025,6 +940,7 @@ class MainWindow(QMainWindow):
 
     def corner_p_detect(self):
         self.DC_save_path = 'Data/thor_kepoint/infer_result/DC_result'
+        self.DC_save_path = self.DC_save_path
         if not os.path.exists(self.DC_save_path):
             os.makedirs(self.DC_save_path, exist_ok=True)
 
@@ -1101,17 +1017,21 @@ class MainWindow(QMainWindow):
             print('未检测到任何坐标')
 
     def closeEvent(self, event):
-        self.timer.stop()
-        if self.camera is not None:
+        with open(self.config_path, 'w', encoding='utf-8') as f:
+            yaml.safe_dump(self.config, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        if self.preview_timer:
+            self.preview_timer.stop()
+        if self.infer_timer:
+            self.infer_timer.stop()
+        if self.camera:
             self.camera.release()
-        if self.serial_listener is not None:
+        if self.serial_listener:
             self.serial_listener.stop()
             self.ser.close()
         event.accept()
 
+
 if __name__ == "__main__":
-    import sys
-    from PyQt5.QtWidgets import QApplication
     
     app = QApplication(sys.argv)
     window = MainWindow()
