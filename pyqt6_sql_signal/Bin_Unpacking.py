@@ -1,9 +1,12 @@
-# 文件输入
+FULL_VERSION = False 
+if FULL_VERSION:
+    from full_features import show_file_info
+else:
+    from lite_features import show_file_info
 import tkinter as tk
 from tkinter import filedialog
 import  os
 from Crypto.Cipher import AES
-from tkinter import filedialog
 from Crypto.Util.Padding import unpad
 from Crypto.Util.Padding import pad
 AES_BLOCK_SIZE = AES.block_size  # AES 加密数据块大小
@@ -199,7 +202,17 @@ def select_to_decrypt_file():
         return encrypted_file_path
     else:
         return None
-    
+
+# def show_file_info(filename):
+#     root =tk.Tk()
+#     root.withdraw()  # 隐藏主窗口
+#     # 显示询问对话框
+#     if 'collar_machine' in filename:
+#         response = messagebox.askyesno("提示", "这是一个圆领固件文件，是否要进行烧录？")
+#     else:
+#         response = messagebox.askyesno("提示", "这是一个罗纹下摆固件文件，是否要进行烧录？")
+#     return response
+
 def encrypt_file():   
     '''
     导入烧录文件
@@ -213,36 +226,44 @@ def encrypt_file():
     packets = []
     encrypted_file_path = select_to_decrypt_file()
 
-    if '.enc' in encrypted_file_path:
-        with open(encrypted_file_path, 'rb') as f:
-            encrypted_data = f.read()  # 读取加密数据
-            # 解密
-            extracted_uid_key, extracted_encrypted_uid, _ = extract_components(encrypted_data)
-            decrypted_uid = decrypt_uid(extracted_encrypted_uid, extracted_uid_key)
-            print("解密后的UID:", decrypted_uid)
-            if decrypted_uid != str(data_key): # 进行UID校验
-                print("UID不匹配，解密失败")
-                return -2  # 可以返回某个错误mark，用于显示错误窗口
-    else:
-        if encrypted_file_path:
+    ret = show_file_info(encrypted_file_path)
+    if ret:
+        if '.enc' in encrypted_file_path:
             with open(encrypted_file_path, 'rb') as f:
-                data = f.read()  
-            encrypted_data = encrypt_data(data)
-            encrypted_file_path = encrypted_file_path.rsplit('.', 1)[0] + ".enc.bin"
-            if encrypted_data != -1:
-                with open(encrypted_file_path, 'wb') as outfile:
-                    outfile.write(encrypted_data)
-            else:
-                return -1  # 加密失败，返回-1
+                encrypted_data = f.read()  # 读取加密数据
+                # 解密
+                extracted_uid_key, extracted_encrypted_uid, _ = extract_components(encrypted_data)
+                decrypted_uid = decrypt_uid(extracted_encrypted_uid, extracted_uid_key)
+                print("解密后的UID:", decrypted_uid)
+                if decrypted_uid != str(data_key): # 进行UID校验
+                    print("UID不匹配，解密失败")
+                    return -2  # 可以返回某个错误mark，用于显示错误窗口
+        else:
+            if encrypted_file_path:
+                with open(encrypted_file_path, 'rb') as f:
+                    data = f.read()  
+                encrypted_data = encrypt_data(data)
+                encrypted_file_path = encrypted_file_path.rsplit('.', 1)[0] + ".enc.bin"
+                if encrypted_data != -1:
+                    with open(encrypted_file_path, 'wb') as outfile:
+                        outfile.write(encrypted_data)
+                else:
+                    return -1  # 加密失败，返回-1
 
-    Bin_variable.inputfinish = 0
-    if encrypted_file_path:
-        Bin_variable.file_name = os.path.basename(encrypted_file_path)
-        Bin_variable.File_size = os.path.getsize(encrypted_file_path) - 32
-        hex_string_big_endian = Bin_variable.File_size.to_bytes(4, byteorder='little').hex()
-        Bin_variable.hex_string_spaced = hex_string_big_endian
-        packets = read_bin_file_and_split(encrypted_file_path)
-        print(f"文件 {encrypted_file_path} 已成功分割成 {len(packets)} 个包。")
-    Bin_variable.inputfinish = 1
-    return True
+        Bin_variable.inputfinish = 0
+        if encrypted_file_path:
+            Bin_variable.file_name = os.path.basename(encrypted_file_path)
+            Bin_variable.File_size = os.path.getsize(encrypted_file_path) - 32
+            hex_string_big_endian = Bin_variable.File_size.to_bytes(4, byteorder='little').hex()
+            Bin_variable.hex_string_spaced = hex_string_big_endian
+            packets = read_bin_file_and_split(encrypted_file_path)
+            print(f"文件 {encrypted_file_path} 已成功分割成 {len(packets)} 个包。")
+        Bin_variable.inputfinish = 1
+        return True
+    else:
+        return -3
 
+
+if __name__ == '__main__':
+    ret = encrypt_file()
+    print(ret)
