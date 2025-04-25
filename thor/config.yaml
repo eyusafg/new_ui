@@ -1,0 +1,26 @@
+base_point:
+- 2300
+- 1810
+factor: 0.042
+origin_im_save_path: C://Data//thor_kepoint/Data
+origin_label_path: C://Data//thor_kepoint/labels
+infer_head_im_save_path: C://Data//thor_kepoint//infer_result//start
+infer_tail_im_save_path: C://Data//thor_kepoint//infer_result//end
+model_path: models//thor_keypoint_20250424_29.onnx
+segm_model_path: models//thor_segm_20250103_model_99.onnx
+save_im_way:
+  head: false
+  full_im: true
+head_roi:
+  x_offset: 600
+  w: 2150
+  y_offset: -290
+  h: 446
+tail_roi:
+  x_offset: 790
+  w: 2500
+  y_offset: -100
+  h: 1000
+x_diff_th: 350
+cached_camera_index: 0
+cached_serial_port: COM8
