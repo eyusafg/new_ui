@@ -40,7 +40,7 @@ from pathlib import Path
 # from scipy.ndimage import uniform_filter1d
 from threading import Thread
 import pandas as pd 
-
+from threading import Thread, Lock
 
 VAIL_MODEL = True
 IS_ENCRYPT = False
@@ -341,6 +341,28 @@ class SafeRunnable(QRunnable):
         with QMutexLocker(self.mutex):
             self._active = False
 
+class CameraCaptureThread(Thread):
+    def __init__(self, camera):
+        super().__init__()
+        self.camera = camera
+        self.latest_frame = None
+        self.running = True
+        self.lock = Lock()
+
+    def run(self):
+        while self.running:
+            ret, frame = self.camera.read()
+            if ret:
+                with self.lock:
+                    self.latest_frame = frame
+
+    def get_latest_frame(self):
+        with self.lock:
+            return self.latest_frame.copy() if self.latest_frame is not None else None
+
+    def stop(self):
+        self.running = False
+
 class InitWorker(SafeRunnable):
     def __init__(self, config_path, parent=None):
         super().__init__(parent)
@@ -582,6 +604,9 @@ class MainWindow(QMainWindow):
 
         # 并行启动初始化任务
         self.start_paraller_init()
+
+        self.camera_capture_thread = CameraCaptureThread(self.camera)
+        self.camera_capture_thread.start()
 
         # 初始化ui
         # self.button_clicked = False
@@ -965,8 +990,10 @@ class MainWindow(QMainWindow):
 
     def update_preview(self):
         if self.camera and self.camera.isOpened():
-            ret, frame = self.camera.read()
-            if ret:
+            # ret, frame = self.camera.read()
+            frame = self.camera_capture_thread.get_latest_frame()
+            # if ret:
+            if frame is not None:
                 rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 rgb_image = cv2.resize(rgb_image, (960, 720))
                 # h, w, ch = rgb_image.shape
@@ -1577,6 +1604,8 @@ class MainWindow(QMainWindow):
         if self.serial_listener:
             self.serial_listener.stop()
             self.ser.close()
+        self.camera_capture_thread.stop()
+        self.camera_capture_thread.join()
         event.accept()
 
 
