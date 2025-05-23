@@ -2,7 +2,7 @@ import logging
 from logging.handlers import QueueHandler, QueueListener
 from queue import Queue
 
-def setup_logging(log_file):
+def setup_logging(log_file, logger_name):
     """配置异步文件日志系统（生产消费模式）"""
     # 创建线程安全队列（建议根据业务量设置合理容量）
     log_queue = Queue(maxsize=10000)  # 最多缓冲10000条日志
@@ -29,7 +29,7 @@ def setup_logging(log_file):
     listener.start()
 
     # 配置根日志记录器（生产者）
-    logger = logging.getLogger()
+    logger = logging.getLogger(logger_name)
     logger.setLevel(logging.DEBUG)
     
     # 清理旧处理器
@@ -40,15 +40,15 @@ def setup_logging(log_file):
     queue_handler = QueueHandler(log_queue)
     logger.addHandler(queue_handler)
 
-    # 确保程序退出时刷新日志
-    def exit_handler():
-        listener.stop()
+    # # 确保程序退出时刷新日志
+    # def exit_handler():
+    #     listener.stop()
     
-    # 注册退出处理
-    import atexit
-    atexit.register(exit_handler)
+    # # 注册退出处理
+    # import atexit
+    # atexit.register(exit_handler)
 
-    return logger
+    return logger,listener
 
 
 
