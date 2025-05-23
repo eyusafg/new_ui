@@ -6,21 +6,25 @@ origin_im_save_path: C://Data//thor_kepoint/Data
 origin_label_path: C://Data//thor_kepoint/labels
 infer_head_im_save_path: C://Data//thor_kepoint//infer_result//start
 infer_tail_im_save_path: C://Data//thor_kepoint//infer_result//end
-model_path: models//thor_keypoint_20250424_29.onnx
-segm_model_path: models//thor_segm_20250103_model_99.onnx
+detect_error_save_path: C://Data//thor_kepoint//error_detect
+save_path: C://Data//thor_keypoint_data
+model_path: models/thor_keypoint_0515_00039_mod_data.onnx
+segm_model_path: models//thor_segm_20250424_model_69.onnx
 save_im_way:
   head: false
-  full_im: true
+  full_im: false
 head_roi:
   x_offset: 600
-  w: 2150
+  w: 2050
   y_offset: -290
-  h: 446
+  h: 406
 tail_roi:
   x_offset: 790
   w: 2500
-  y_offset: -100
-  h: 1000
-x_diff_th: 350
+  y_offset: -500
+  h: 1300
+x_diff_th: 250
+tail_offset: None
+y_offset: 3.5
 cached_camera_index: 0
-cached_serial_port: COM8
+cached_serial_port: COM9
