@@ -4,7 +4,7 @@ import numpy as np
 
 
 class AlignmentOptimizer:
-    def __init__(self, head_x_coords, tail_x_coords, roi_rotate_base_p_x, roi_tail_rotate_p_x):
+    def __init__(self, head_x_coords, tail_x_coords, roi_rotate_base_p_x, roi_tail_rotate_p_x, is_V=False):
 
         """
         初始化对齐优化器
@@ -30,7 +30,16 @@ class AlignmentOptimizer:
         # print('self.cumsum', self.cumsum)
         self.total = self.cumsum[-1]  # 总偏移量
         self.optimal_idx = None
+        self.is_V = is_V
+        self.total_flag = False
 
+    def get_max_offset(self):
+        """获取最大偏移值"""
+        max_offset = self.aligned[-1]
+        max_front = np.max(self.front)
+        rear = max_offset - max_front
+        return max_front, rear
+    
     def make_unique(self):
         """确保 self.aligned 中的所有值都是唯一的"""
         epsilon = 0.01
@@ -70,7 +79,7 @@ class AlignmentOptimizer:
             if current_diff < min_diff:
                 min_diff = current_diff
                 best_k = k
-
+        print('current_diff_list', current_diff_list)
         self.optimal_idx = best_k + 1
         original_best_k = self.original_indices[self.optimal_idx]
         self.optimal_left_offset = self.cumsum[self.optimal_idx-1] - (self.optimal_idx) * self.cumsum[self.optimal_idx]
@@ -85,8 +94,8 @@ class AlignmentOptimizer:
         # print('circle_head_x', circle_head_x)
         # print('circle_tail_x', circle_tail_x)
         '''
-        需要从对齐偏移中找到最小15个， 然后求最大 最小只差小于一定阈值
-        然后这15个最小的尾部x值以及对应得头部得值
+        需要从对齐偏移中找到最小35个， 然后求最大 最小只差小于一定阈值
+        然后这35个最小的尾部x值以及对应得头部得值
         需要防止可能存在多个存在多个相同得最小得x 
         '''
 
@@ -94,19 +103,24 @@ class AlignmentOptimizer:
         indexed_diffs = sorted(
             [(abs(val), k, val) for k, val in enumerate(current_diff_list)],
             key=lambda x: x[0]  # 按绝对值排序
-        )[:15]  # 取绝对值最小的15个
-        # 提取这15个元素的原始current_diff值（包含正负）
+        )[:30]  # 取绝对值最小的35个
+        # 提取这35个元素的原始current_diff值（包含正负）
         original_diffs = [val for (abs_val, k, val) in indexed_diffs]
         print('original_diffs',original_diffs)
-        # 计算这15个原始值的极差
+        # 计算这35个原始值的极差
         max_sn_15 = max(original_diffs)
         min_sn_15 = min(original_diffs)
 
         '''
-        2500 的阈值对于平直的边缘可能太大了
-        但是对于类似燕尾槽等形状 可能刚合适
+        0506 修改2500为3500
+        0513传入的前部和尾部的坐标事先经过y排序， 确保前部和尾部一一对应， 阈值改为2000
         '''
-        if max_sn_15 - min_sn_15 <= 2500:
+        front_offset_min = None
+        rear_offset_min = None
+        circle_head_x_min = None
+        circle_tail_x_min = None
+        if max_sn_15 - min_sn_15 <= 1200 and self.is_V is False:
+            self.total_flag = True
             print(66666666666666666666666666666666666666666666666666666)
 
             # 提取原始k值（注意这里k是原始分割点索引）
@@ -136,14 +150,27 @@ class AlignmentOptimizer:
                 min_rear_idx = np.argmin(rear_values)
                 # 最终确定最佳原始索引
                 original_best_k = min_tail_original[min_rear_idx]
+                
+        elif self.is_V:
+            '''
+            V型取最小值
+            '''
+            indices_min = np.argmin(self.rear)
+            rear_offset_min = self.rear[indices_min]
+            front_offset_min = t - rear_offset_min
+            circle_head_x_min = front_offset_min + self.roi_rotate_base_p_x
+            circle_tail_x_min = self.tail_x_coords[indices_min]
 
         # front_offset = self.front[original_best_k]
         rear_offset = self.rear[original_best_k]
         front_offset = t - rear_offset
-        circle_head_x_ = self.head_x_coords[original_best_k]
+        # circle_head_x_ = self.head_x_coords[original_best_k]
+        circle_head_x_ = front_offset + self.roi_rotate_base_p_x
         circle_tail_x_ = self.tail_x_coords[original_best_k]         
-
-        return front_offset, rear_offset, circle_head_x,circle_tail_x, circle_head_x_, circle_tail_x_
+        if front_offset_min is None:
+            return front_offset, rear_offset, circle_head_x, circle_tail_x, circle_head_x_, circle_tail_x_, self.total_flag
+        else:
+            return front_offset_min, rear_offset_min, circle_head_x,circle_tail_x, circle_head_x_min, circle_tail_x_min, self.total_flag
     
     # def visualize(self):
     #     """可视化对齐偏移值与最优分割点"""
